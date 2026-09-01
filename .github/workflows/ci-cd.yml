@@ -1,0 +1,143 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+
+jobs:
+  backend-test:
+    name: Backend — lint, typecheck, unit tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cab_admin
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: cab_platform_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U cab_admin -d cab_platform_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      - name: Install dependencies
+        working-directory: backend
+        run: npm install
+      - name: Generate Prisma client
+        working-directory: backend
+        run: npx prisma generate
+      - name: Lint
+        working-directory: backend
+        run: npm run lint
+      - name: Run database migrations (test DB)
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://cab_admin:changeme@localhost:5432/cab_platform_test?schema=public
+        run: npx prisma migrate deploy
+      - name: Unit tests
+        working-directory: backend
+        run: npm run test
+      - name: Build
+        working-directory: backend
+        run: npm run build
+
+  admin-dashboard-build:
+    name: Admin Dashboard — build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-dashboard/package-lock.json
+      - working-directory: admin-dashboard
+        run: npm install
+      - working-directory: admin-dashboard
+        env:
+          NEXT_PUBLIC_API_URL: https://api.placeholder.example/api/v1
+          NEXT_PUBLIC_SOCKET_URL: https://api.placeholder.example
+        run: npm run build
+
+  corporate-portal-build:
+    name: Corporate Portal — build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: corporate-portal/package-lock.json
+      - working-directory: corporate-portal
+        run: npm install
+      - working-directory: corporate-portal
+        env:
+          NEXT_PUBLIC_API_URL: https://api.placeholder.example/api/v1
+        run: npm run build
+
+  # Builds & pushes container images once code on main/staging has passed the
+  # jobs above. Deploy-to-server step is left as a template — plug in your
+  # target (SSH + docker compose pull/up, ECS, Cloud Run, k8s, etc).
+  build-and-push:
+    name: Build & push Docker images
+    runs-on: ubuntu-latest
+    needs: [backend-test, admin-dashboard-build, corporate-portal-build]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging')
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: backend
+            context: ./backend
+          - name: admin-dashboard
+            context: ./admin-dashboard
+          - name: corporate-portal
+            context: ./corporate-portal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/cab-platform-${{ matrix.name }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/cab-platform-${{ matrix.name }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "Wire this step to your infrastructure:"
+          echo "  - SSH + 'docker compose -f docker-compose.prod.yml pull && up -d', OR"
+          echo "  - aws ecs update-service ..., OR"
+          echo "  - gcloud run deploy ..., OR"
+          echo "  - kubectl set image ... / helm upgrade ..."
+          echo "See docs/DEPLOYMENT.md for the manual equivalent of each option."

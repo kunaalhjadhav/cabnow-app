@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.next/
+build/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+postgres_data/
+redis_data/
+

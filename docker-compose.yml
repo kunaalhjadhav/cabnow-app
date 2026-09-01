@@ -1,0 +1,90 @@
+# Local development stack: Postgres + Redis + backend API + both web portals.
+# Mobile apps are not containerized — run them with `flutter run` against
+# the backend exposed here (see mobile/*/README.md).
+#
+# Usage:
+#   cp backend/.env.example backend/.env               # then fill in real keys
+#   cp admin-dashboard/.env.example admin-dashboard/.env.local
+#   cp corporate-portal/.env.example corporate-portal/.env.local
+#   docker compose up --build
+#
+# First run only, once the backend container is healthy:
+#   docker compose exec backend npx prisma migrate deploy
+#   docker compose exec backend npm run prisma:seed
+
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cab_admin
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: cab_platform
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U cab_admin -d cab_platform']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql://cab_admin:changeme@postgres:5432/cab_platform?schema=public
+      REDIS_URL: redis://redis:6379
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  admin-dashboard:
+    build:
+      context: ./admin-dashboard
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:3000/api/v1
+        NEXT_PUBLIC_SOCKET_URL: http://localhost:3000
+    restart: unless-stopped
+    ports:
+      - '3001:3001'
+    depends_on:
+      - backend
+
+  corporate-portal:
+    build:
+      context: ./corporate-portal
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:3000/api/v1
+    restart: unless-stopped
+    ports:
+      - '3002:3002'
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:

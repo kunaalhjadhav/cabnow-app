@@ -1,0 +1,2 @@
+-- AlterEnum
+ALTER TYPE "FareLineType" ADD VALUE 'PACKAGE_FARE';

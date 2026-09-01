@@ -1,0 +1,1271 @@
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { AuthenticatedUser } from '../common/decorators/current-user.decorator';
+import { PrismaService } from '../prisma/prisma.service';
+import { MapsService } from '../maps/maps.service';
+import { PricingService } from '../pricing/pricing.service';
+import { DispatchService } from '../dispatch/dispatch.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { generateNumericOtp } from '../common/utils/hash.util';
+import { CreateBookingDto } from './dto/create-booking.dto';
+import { CancelBookingDto } from './dto/cancel-booking.dto';
+
+@Injectable()
+export class BookingsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly maps: MapsService,
+    private readonly pricing: PricingService,
+    private readonly dispatch: DispatchService,
+    private readonly notifications: NotificationsService,
+  ) {}
+
+  async create(dto: CreateBookingDto, requestor: AuthenticatedUser) {
+    // The client-supplied customerId/companyId/employeeId must never be trusted as-is: without
+    // this, a CUSTOMER could attribute a ride to someone else's account, or — far worse — a
+    // CORPORATE_BOOKER could pass a different company's id and have THAT company's credit line
+    // billed for their ride (spec: Corporate Company -> Platform -> Vendor billing flow). Scope
+    // every identity field server-side from the requestor's own JWT claims instead.
+    if (requestor.role === 'CUSTOMER') {
+      dto.customerId = requestor.customerId;
+      dto.companyId = undefined;
+      dto.employeeId = undefined;
+    } else if (BookingsService.CORPORATE_ROLES.includes(requestor.role)) {
+      dto.companyId = requestor.companyId;
+      dto.customerId = undefined;
+      if (dto.employeeId) {
+        const employee = await this.prisma.employee.findUnique({ where: { id: dto.employeeId } });
+        if (!employee || employee.companyId !== requestor.companyId) {
+          throw new BadRequestException('Unknown employee for this company');
+        }
+      }
+    } else if (!BookingsService.ADMIN_ROLES.includes(requestor.role)) {
+      // DRIVER / VENDOR_ADMIN have no business creating bookings.
+      throw new ForbiddenException('Not permitted to create bookings');
+    }
+    // Admin roles pass dto.customerId/companyId/employeeId through unscoped — they're
+    // allowed to book on behalf of any customer or company (support/ops tooling).
+
+    const category = await this.prisma.vehicleCategory.findUnique({ where: { id: dto.categoryId } });
+    if (!category) throw new BadRequestException('Unknown vehicle category');
+
+    let pkg: { id: string; packageType: string; flatFare: any } | null = null;
+    if (dto.packageId) {
+      pkg = await this.prisma.package.findUnique({ where: { id: dto.packageId } });
+      if (!pkg) throw new BadRequestException('Unknown package');
+    }
+
+    const stops = dto.stops ?? [];
+    const waypoints = [dto.pickup, ...stops, dto.drop];
+    const route = await this.maps.estimateRoute(waypoints);
+    const totalWaitMinutes = stops.reduce((s, st) => s + (st.plannedWaitMinutes ?? 0), 0);
+
+    const fare = await this.pricing.calculateFare({
+      categoryId: dto.categoryId,
+      companyId: dto.companyId,
+      city: dto.city,
+      zone: dto.zone,
+      packageType: pkg?.packageType,
+      packageFlatFare: pkg?.flatFare != null ? Number(pkg.flatFare) : null,
+      distanceKm: route.distanceKm,
+      durationMinutes: route.durationMinutes,
+      waitingMinutes: totalWaitMinutes,
+      extraStops: stops.length,
+      discountCode: dto.discountCode,
+      pickupAt: dto.scheduledAt ? new Date(dto.scheduledAt) : new Date(),
+    });
+
+    // Corporate bookings made by a BOOKER (not an admin) go through the
+    // portal's approval workflow (spec: "Corporate Portal > Approval workflow").
+    // Admins and customers booking for themselves never need approval.
+    const approvalRequired = dto.type === 'CORPORATE_PACKAGE' && requestor.role === 'CORPORATE_BOOKER';
+
+    const booking = await this.prisma.booking.create({
+      data: {
+        source: dto.source,
+        type: dto.type,
+        status: approvalRequired ? 'PENDING_APPROVAL' : 'CONFIRMED',
+        customerId: dto.customerId,
+        companyId: dto.companyId,
+        employeeId: dto.employeeId,
+        bookedByUserId: requestor.userId,
+        packageId: dto.packageId,
+        categoryId: dto.categoryId,
+        pickupLabel: dto.pickup.label,
+        pickupLat: dto.pickup.lat,
+        pickupLng: dto.pickup.lng,
+        dropLabel: dto.drop.label,
+        dropLat: dto.drop.lat,
+        dropLng: dto.drop.lng,
+        scheduledAt: dto.scheduledAt ? new Date(dto.scheduledAt) : null,
+        passengerName: dto.passengerName,
+        passengerPhone: dto.passengerPhone,
+        specialInstructions: dto.specialInstructions,
+        estimatedDistanceKm: route.distanceKm,
+        estimatedDurationMinutes: route.durationMinutes,
+        estimatedFare: fare.total,
+        approvalRequired,
+        stops: {
+          create: stops.map((s, i) => ({
+            sequence: i + 1,
+            label: s.label,
+            lat: s.lat,
+            lng: s.lng,
+            plannedWaitMinutes: s.plannedWaitMinutes ?? 0,
+          })),
+        },
+        fareBreakdowns: {
+          create: fare.lines.map((l) => ({ lineType: l.lineType, label: l.label, amount: l.amount, meta: l.meta ?? {} })),
+        },
+      },
+      include: { stops: true, fareBreakdowns: true },
+    });
+
+    if (!approvalRequired && dto.type === 'IMMEDIATE') {
+      await this.confirmAndDispatch(booking.id);
+    }
+
+    return this.findOne(booking.id);
+  }
+
+  private static readonly ADMIN_ROLES = ['SUPER_ADMIN', 'OPS_ADMIN', 'FINANCE_ADMIN', 'SUPPORT_ADMIN'];
+  private static readonly CORPORATE_ROLES = ['CORPORATE_ADMIN', 'CORPORATE_BOOKER', 'CORPORATE_APPROVER'];
+
+  /**
+   * Scopes list filters server-side by role (spec §12: company-level data
+   * isolation) rather than trusting whatever customerId/companyId the client
+   * passed in — a customer or corporate booker can only ever see their own
+   * bookings no matter what query params they send.
+   */
+  async findAll(requestor: AuthenticatedUser, filters: { customerId?: string; companyId?: string; status?: string }) {
+    const scoped = { ...filters };
+    if (BookingsService.CORPORATE_ROLES.includes(requestor.role)) {
+      scoped.customerId = undefined;
+      scoped.companyId = requestor.companyId;
+    } else if (requestor.role === 'CUSTOMER') {
+      scoped.companyId = undefined;
+      scoped.customerId = requestor.customerId;
+    } else if (!BookingsService.ADMIN_ROLES.includes(requestor.role)) {
+      // Any other role (e.g. DRIVER) has no business listing bookings this way.
+      throw new ForbiddenException('Not permitted to list bookings');
+    }
+    // Admin roles pass filters through unscoped — they're allowed to see everything.
+
+    return this.prisma.booking.findMany({
+      where: { customerId: scoped.customerId, companyId: scoped.companyId, status: scoped.status as any },
+      include: { stops: true, trip: true, category: true },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async findOne(id: string) {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id },
+      include: { stops: true, trip: { include: { driver: true, vehicle: true, stops: true } }, fareBreakdowns: true, category: true, package: true },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    return booking;
+  }
+
+  async findOneScoped(id: string, requestor: AuthenticatedUser) {
+    const booking = await this.findOne(id);
+    this.assertBookingAccess(requestor, booking);
+    return booking;
+  }
+
+  /** Throws unless `requestor` is allowed to see/act on this booking. */
+  private assertBookingAccess(requestor: AuthenticatedUser, booking: Awaited<ReturnType<BookingsService['findOne']>>) {
+    if (BookingsService.ADMIN_ROLES.includes(requestor.role)) return;
+    if (BookingsService.CORPORATE_ROLES.includes(requestor.role)) {
+      if (booking.companyId && booking.companyId === requestor.companyId) return;
+      throw new ForbiddenException("You don't have access to this booking");
+    }
+    if (requestor.role === 'CUSTOMER') {
+      if (booking.customerId && booking.customerId === requestor.customerId) return;
+      throw new ForbiddenException("You don't have access to this booking");
+    }
+    if (requestor.role === 'DRIVER') {
+      if (booking.trip?.driverId && booking.trip.driverId === requestor.driverId) return;
+      throw new ForbiddenException("You don't have access to this booking");
+    }
+    throw new ForbiddenException("You don't have access to this booking");
+  }
+
+  async approve(id: string, requestor: AuthenticatedUser) {
+    const booking = await this.findOne(id);
+    this.assertBookingAccess(requestor, booking);
+    if (booking.status !== 'PENDING_APPROVAL') {
+      throw new BadRequestException('Only bookings pending approval can be approved');
+    }
+    await this.prisma.booking.update({
+      where: { id },
+      data: { status: 'CONFIRMED', approvedByUserId: requestor.userId, approvedAt: new Date() },
+    });
+    if (booking.type === 'IMMEDIATE') {
+      await this.confirmAndDispatch(id);
+    }
+    return this.findOne(id);
+  }
+
+  async reject(id: string, requestor: AuthenticatedUser, reason?: string) {
+    const booking = await this.findOne(id);
+    this.assertBookingAccess(requestor, booking);
+    if (booking.status !== 'PENDING_APPROVAL') {
+      throw new BadRequestException('Only bookings pending approval can be rejected');
+    }
+    return this.prisma.booking.update({
+      where: { id },
+      data: {
+        status: 'CANCELLED',
+        cancelledByUserId: requestor.userId,
+        cancelledAt: new Date(),
+        cancellationReason: reason ?? 'Rejected during approval',
+      },
+    });
+  }
+
+  /** Creates the Trip row and hands off to the dispatch engine to find a driver (spec §8 booking flow). */
+  async confirmAndDispatch(bookingId: string) {
+    const booking = await this.findOne(bookingId);
+    if (booking.status !== 'CONFIRMED') return booking;
+
+    const existingTrip = await this.prisma.trip.findUnique({ where: { bookingId } });
+    if (existingTrip) return booking;
+
+    await this.prisma.$transaction(async (tx) => {
+      const trip = await tx.trip.create({ data: { bookingId, status: 'ASSIGNED' } });
+      await tx.tripStop.createMany({
+        data: booking.stops.map((s) => ({
+          tripId: trip.id,
+          bookingStopId: s.id,
+          sequence: s.sequence,
+          label: s.label,
+          lat: s.lat,
+          lng: s.lng,
+          plannedWaitMinutes: s.plannedWaitMinutes,
+        })),
+      });
+      await tx.booking.update({ where: { id: bookingId }, data: { status: 'DISPATCHING' } });
+    });
+
+    const trip = await this.prisma.trip.findUnique({ where: { bookingId } });
+    const assigned = await this.dispatch.assignNearestDriver(trip!.id, booking.categoryId, {
+      lat: Number(booking.pickupLat),
+      lng: Number(booking.pickupLng),
+    });
+
+    if (!assigned) {
+      // Left in DISPATCHING; a background retry job would re-attempt this in production.
+      return this.findOne(bookingId);
+    }
+
+    const otpCode = generateNumericOtp(4);
+    await this.prisma.trip.update({ where: { id: trip!.id }, data: { otpCode } });
+
+    if (booking.passengerPhone) {
+      await this.notifications.sendSms(
+        booking.passengerPhone,
+        `Your driver is on the way. Share OTP ${otpCode} with the driver at pickup to start your trip.`,
+      );
+    }
+
+    return this.findOne(bookingId);
+  }
+
+  async cancel(id: string, requestor: AuthenticatedUser, dto: CancelBookingDto) {
+    const booking = await this.findOne(id);
+    this.assertBookingAccess(requestor, booking);
+    if (['COMPLETED', 'CANCELLED'].includes(booking.status)) {
+      throw new BadRequestException('Booking is already finished or cancelled');
+    }
+
+    let cancellationFee = 0;
+    if (booking.trip && booking.trip.status !== 'ASSIGNED') {
+      // Once a driver has started arriving, cancellation may carry a configurable fee.
+      cancellationFee = await this.pricing.calculateCancellationFee({
+        categoryId: booking.categoryId,
+        companyId: booking.companyId,
+        city: undefined,
+        zone: undefined,
+      });
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.booking.update({
+        where: { id },
+        data: {
+          status: 'CANCELLED',
+          cancelledAt: new Date(),
+          cancelledByUserId: requestor.userId,
+          cancellationReason: dto.reason,
+        },
+      });
+      if (booking.trip) {
+        await tx.trip.update({
+          where: { id: booking.trip.id },
+          data: { status: 'CANCELLED', cancelledAt: new Date(), cancelledByUserId: requestor.userId, cancellationReason: dto.reason },
+        });
+        if (booking.trip.driverId) {
+          await tx.driver.update({ where: { id: booking.trip.driverId }, data: { isAvailable: true } });
+        }
+        if (cancellationFee > 0) {
+          await tx.fareBreakdown.create({
+            data: { tripId: booking.trip.id, lineType: 'CANCELLATION_FEE', label: 'Cancellation fee', amount: cancellationFee },
+          });
+        }
+      }
+    });
+
+    return this.findOne(id);
+  }
+}
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { PricingService } from '../pricing/pricing.service';
+import { CommissionService } from '../commission/commission.service';
+import { TrackingGateway } from '../tracking/tracking.gateway';
+import { CompleteTripDto, RateTripDto } from './dto/trip-actions.dto';
+import { AuthenticatedUser } from '../common/decorators/current-user.decorator';
+
+const ADMIN_ROLES = ['SUPER_ADMIN', 'OPS_ADMIN', 'FINANCE_ADMIN', 'SUPPORT_ADMIN'];
+const CORPORATE_ROLES = ['CORPORATE_ADMIN', 'CORPORATE_BOOKER', 'CORPORATE_APPROVER'];
+
+@Injectable()
+export class TripsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly pricing: PricingService,
+    private readonly commission: CommissionService,
+    private readonly tracking: TrackingGateway,
+  ) {}
+
+  async findOne(id: string) {
+    const trip = await this.prisma.trip.findUnique({
+      where: { id },
+      include: {
+        booking: true,
+        driver: { include: { user: true } },
+        vehicle: true,
+        stops: true,
+        routeChanges: true,
+        payments: true,
+        fareBreakdowns: true,
+        ratings: true,
+      },
+    });
+    if (!trip) throw new NotFoundException('Trip not found');
+    return trip;
+  }
+
+  async findOneScoped(id: string, requestor: AuthenticatedUser) {
+    const trip = await this.findOne(id);
+    this.assertTripAccess(requestor, trip);
+    return trip;
+  }
+
+  /** Throws unless `requestor` is allowed to see/act on this trip (spec §12 data isolation). */
+  private assertTripAccess(requestor: AuthenticatedUser, trip: { driverId: string | null; booking: { companyId: string | null; customerId: string | null } }) {
+    if (ADMIN_ROLES.includes(requestor.role)) return;
+    if (CORPORATE_ROLES.includes(requestor.role)) {
+      if (trip.booking.companyId && trip.booking.companyId === requestor.companyId) return;
+      throw new ForbiddenException("You don't have access to this trip");
+    }
+    if (requestor.role === 'CUSTOMER') {
+      if (trip.booking.customerId && trip.booking.customerId === requestor.customerId) return;
+      throw new ForbiddenException("You don't have access to this trip");
+    }
+    if (requestor.role === 'DRIVER') {
+      if (trip.driverId && trip.driverId === requestor.driverId) return;
+      throw new ForbiddenException("You don't have access to this trip");
+    }
+    throw new ForbiddenException("You don't have access to this trip");
+  }
+
+  /** A DRIVER may only ever progress a trip that was actually dispatched to them. */
+  private async assertOwnDriverTrip(requestor: AuthenticatedUser, tripId: string) {
+    const trip = await this.findOne(tripId);
+    if (!trip.driverId || trip.driverId !== requestor.driverId) {
+      throw new ForbiddenException("You don't have access to this trip");
+    }
+    return trip;
+  }
+
+  findForDriver(driverId: string, status?: string) {
+    return this.prisma.trip.findMany({
+      where: { driverId, status: status as any },
+      include: { booking: true, stops: true },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  private async setStatus(id: string, status: string, extra: Record<string, unknown> = {}) {
+    const trip = await this.prisma.trip.update({ where: { id }, data: { status: status as any, ...extra } });
+    this.tracking.emitTripEvent(id, 'trip:status', { status });
+    return trip;
+  }
+
+  async markDriverArriving(id: string, requestor: AuthenticatedUser) {
+    const trip = await this.assertOwnDriverTrip(requestor, id);
+    if (trip.status !== 'ASSIGNED') throw new BadRequestException('Trip is not in ASSIGNED state');
+    return this.setStatus(id, 'DRIVER_ARRIVING');
+  }
+
+  async markDriverArrived(id: string, requestor: AuthenticatedUser) {
+    const trip = await this.assertOwnDriverTrip(requestor, id);
+    if (!['ASSIGNED', 'DRIVER_ARRIVING'].includes(trip.status)) {
+      throw new BadRequestException('Trip is not in a state where the driver can arrive');
+    }
+    return this.setStatus(id, 'DRIVER_ARRIVED', { arrivedAtPickupAt: new Date() });
+  }
+
+  async verifyOtp(id: string, code: string, requestor: AuthenticatedUser) {
+    const trip = await this.assertOwnDriverTrip(requestor, id);
+    if (trip.status !== 'DRIVER_ARRIVED') {
+      throw new BadRequestException('Driver must be at the pickup location before OTP verification');
+    }
+    if (!trip.otpCode || trip.otpCode !== code) {
+      throw new BadRequestException('Incorrect OTP');
+    }
+    return this.setStatus(id, 'OTP_VERIFIED', { otpVerifiedAt: new Date() });
+  }
+
+  async startTrip(id: string, requestor: AuthenticatedUser) {
+    const trip = await this.assertOwnDriverTrip(requestor, id);
+    if (trip.status !== 'OTP_VERIFIED') {
+      throw new BadRequestException('OTP must be verified before starting the trip');
+    }
+    // Booking.status stays at DRIVER_ASSIGNED for the live-trip window — Trip.status
+    // (IN_PROGRESS, AT_STOP, ...) is the source of truth for in-trip lifecycle; Booking
+    // only advances again on completion/cancellation.
+    return this.setStatus(id, 'IN_PROGRESS', { startedAt: new Date() });
+  }
+
+  async arriveAtStop(tripId: string, tripStopId: string, requestor: AuthenticatedUser) {
+    await this.assertOwnDriverTrip(requestor, tripId);
+    const stop = await this.prisma.tripStop.findUnique({ where: { id: tripStopId } });
+    if (!stop || stop.tripId !== tripId) throw new NotFoundException('Trip stop not found');
+    await this.prisma.tripStop.update({ where: { id: tripStopId }, data: { status: 'ARRIVED', arrivedAt: new Date() } });
+    return this.setStatus(tripId, 'AT_STOP');
+  }
+
+  async departStop(tripId: string, tripStopId: string, requestor: AuthenticatedUser) {
+    await this.assertOwnDriverTrip(requestor, tripId);
+    const stop = await this.prisma.tripStop.findUnique({ where: { id: tripStopId } });
+    if (!stop || stop.tripId !== tripId) throw new NotFoundException('Trip stop not found');
+    const actualWaitMinutes = stop.arrivedAt
+      ? Math.max(0, Math.round((Date.now() - stop.arrivedAt.getTime()) / 60000))
+      : 0;
+    await this.prisma.tripStop.update({
+      where: { id: tripStopId },
+      data: { status: 'DEPARTED', departedAt: new Date(), actualWaitMinutes },
+    });
+    return this.setStatus(tripId, 'IN_PROGRESS');
+  }
+
+  async completeTrip(id: string, dto: CompleteTripDto, requestor: AuthenticatedUser) {
+    if (requestor.role === 'DRIVER') {
+      await this.assertOwnDriverTrip(requestor, id);
+    }
+    const trip = await this.findOne(id);
+    if (!['IN_PROGRESS', 'AT_STOP'].includes(trip.status)) {
+      throw new BadRequestException('Trip must be in progress to complete');
+    }
+
+    const booking = trip.booking;
+    const distanceKm = dto.actualDistanceKm ?? Number(booking.estimatedDistanceKm ?? 0);
+    const durationMinutes = dto.actualDurationMinutes ?? booking.estimatedDurationMinutes ?? 0;
+    const waitingMinutes = trip.stops.reduce((sum, s) => sum + (s.actualWaitMinutes ?? s.plannedWaitMinutes ?? 0), 0);
+    const pkg = booking.packageId ? await this.prisma.package.findUnique({ where: { id: booking.packageId } }) : null;
+
+    const fare = await this.pricing.calculateFare({
+      categoryId: booking.categoryId,
+      companyId: booking.companyId,
+      packageType: pkg?.packageType,
+      packageFlatFare: pkg?.flatFare != null ? Number(pkg.flatFare) : null,
+      distanceKm,
+      durationMinutes,
+      waitingMinutes,
+      extraStops: trip.stops.length,
+      tollAmount: dto.tollAmount,
+      parkingAmount: dto.parkingAmount,
+    });
+
+    const approvedRouteChangeFare = trip.routeChanges
+      .filter((rc) => rc.status === 'APPROVED' || rc.status === 'AUTO_APPROVED')
+      .reduce((sum, rc) => sum + Number(rc.additionalFare), 0);
+
+    const finalFare = Math.round((fare.total + approvedRouteChangeFare) * 100) / 100;
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.fareBreakdown.createMany({
+        data: fare.lines.map((l) => ({ tripId: id, lineType: l.lineType, label: l.label, amount: l.amount, meta: l.meta ?? {} })),
+      });
+      if (approvedRouteChangeFare !== 0) {
+        await tx.fareBreakdown.create({
+          data: { tripId: id, lineType: 'ROUTE_CHANGE_ADJUSTMENT', label: 'Approved route changes', amount: approvedRouteChangeFare },
+        });
+      }
+      await tx.trip.update({
+        where: { id },
+        data: {
+          status: 'COMPLETED',
+          completedAt: new Date(),
+          actualDistanceKm: distanceKm,
+          actualDurationMinutes: durationMinutes,
+          finalFare,
+          polyline: dto.polyline,
+        },
+      });
+      await tx.booking.update({ where: { id: booking.id }, data: { status: 'COMPLETED' } });
+      if (trip.driverId) {
+        await tx.driver.update({ where: { id: trip.driverId }, data: { isAvailable: true, totalTrips: { increment: 1 } } });
+      }
+      if (booking.companyId) {
+        await tx.corporateCompany.update({
+          where: { id: booking.companyId },
+          data: { creditUsed: { increment: finalFare } },
+        });
+      }
+      await tx.payment.create({
+        data: {
+          tripId: id,
+          method: booking.companyId ? 'CORPORATE_BILLING' : (dto.paymentMethod ?? 'UPI'),
+          status: booking.companyId ? 'CAPTURED' : 'PENDING',
+          amount: finalFare,
+        },
+      });
+    });
+
+    // Commission + driver earning (spec §5) — computed after commit so it reads the final fare cleanly.
+    if (trip.driverId && trip.vehicleId) {
+      const vehicle = await this.prisma.vehicle.findUnique({ where: { id: trip.vehicleId } });
+      const result = await this.commission.calculateCommission(
+        {
+          vendorId: vehicle?.vendorId,
+          driverId: trip.driverId,
+          categoryId: booking.categoryId,
+          companyId: booking.companyId,
+          packageType: pkg?.packageType,
+        },
+        finalFare,
+      );
+      await this.prisma.driverEarning.create({
+        data: {
+          driverId: trip.driverId,
+          tripId: id,
+          description: `Trip earning (${result.ruleName}: fare ₹${finalFare} − commission ₹${result.commissionAmount})`,
+          amount: result.vendorPayable,
+          isCredit: true,
+        },
+      });
+    }
+
+    this.tracking.emitTripEvent(id, 'trip:completed', { finalFare });
+    return this.findOne(id);
+  }
+
+  async rate(tripId: string, requestor: AuthenticatedUser, dto: RateTripDto) {
+    const trip = await this.findOne(tripId);
+    this.assertTripAccess(requestor, trip);
+    if (trip.status !== 'COMPLETED') throw new BadRequestException('Can only rate a completed trip');
+
+    const rating = await this.prisma.rating.create({
+      data: { tripId, ratedByUserId: requestor.userId, ratedUserId: dto.ratedUserId, score: dto.score, comment: dto.comment },
+    });
+
+    if (trip.driverId) {
+      const driverUser = await this.prisma.driver.findUnique({ where: { id: trip.driverId } });
+      if (driverUser && driverUser.userId === dto.ratedUserId) {
+        const agg = await this.prisma.rating.aggregate({
+          where: { ratedUserId: dto.ratedUserId },
+          _avg: { score: true },
+        });
+        await this.prisma.driver.update({
+          where: { id: trip.driverId },
+          data: { rating: agg._avg.score ?? 5 },
+        });
+      }
+    }
+
+    return rating;
+  }
+}
+import { Body, Controller, ForbiddenException, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
+import { CorporateService } from './corporate.service';
+import {
+  CreateCorporateCompanyDto,
+  InviteCorporateUserDto,
+  UpdateCorporateCompanyDto,
+  UpsertRouteEditConfigDto,
+} from './dto/corporate.dto';
+import { Roles } from '../common/decorators/roles.decorator';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { CurrentUser, AuthenticatedUser } from '../common/decorators/current-user.decorator';
+
+const CORPORATE_ROLES = [UserRole.CORPORATE_ADMIN, UserRole.CORPORATE_BOOKER, UserRole.CORPORATE_APPROVER];
+
+@ApiTags('corporate')
+@ApiBearerAuth('access-token')
+@UseGuards(RolesGuard)
+@Controller('corporate/companies')
+export class CorporateController {
+  constructor(private readonly service: CorporateService) {}
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN)
+  @Post()
+  create(@Body() dto: CreateCorporateCompanyDto) {
+    return this.service.create(dto);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN, UserRole.FINANCE_ADMIN)
+  @Get()
+  findAll() {
+    return this.service.findAll();
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN, UserRole.FINANCE_ADMIN, UserRole.CORPORATE_ADMIN, UserRole.CORPORATE_BOOKER, UserRole.CORPORATE_APPROVER)
+  @Get(':id')
+  findOne(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, id);
+    return this.service.findOne(id);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN)
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() dto: UpdateCorporateCompanyDto) {
+    return this.service.update(id, dto);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN)
+  @Patch(':id/approve')
+  approve(@Param('id') id: string) {
+    return this.service.approve(id);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN, UserRole.CORPORATE_ADMIN)
+  @Post(':id/users')
+  inviteUser(@Param('id') id: string, @Body() dto: InviteCorporateUserDto, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, id);
+    return this.service.inviteUser(id, dto);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN, UserRole.CORPORATE_ADMIN)
+  @Get(':id/users')
+  listUsers(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, id);
+    return this.service.listUsers(id);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN, UserRole.CORPORATE_ADMIN, UserRole.CORPORATE_BOOKER)
+  @Get(':id/route-edit-config')
+  getRouteEditConfig(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, id);
+    return this.service.getRouteEditConfig(id);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN)
+  @Post(':id/route-edit-config')
+  upsertRouteEditConfig(@Param('id') id: string, @Body() dto: UpsertRouteEditConfigDto) {
+    return this.service.upsertRouteEditConfig(id, dto);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN, UserRole.FINANCE_ADMIN, UserRole.CORPORATE_ADMIN)
+  @Get(':id/billing-summary')
+  billingSummary(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, id);
+    return this.service.billingSummary(id);
+  }
+
+  /** A CORPORATE_* user may only ever act on their own company (spec §12 data isolation). */
+  private assertOwnCompany(user: AuthenticatedUser, companyId: string) {
+    if (CORPORATE_ROLES.includes(user.role as UserRole) && user.companyId !== companyId) {
+      throw new ForbiddenException("You don't have access to this company");
+    }
+  }
+}
+
+@ApiTags('corporate')
+@ApiBearerAuth('access-token')
+@UseGuards(RolesGuard)
+@Controller('corporate/route-edit-config')
+export class PlatformRouteEditConfigController {
+  constructor(private readonly service: CorporateService) {}
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN)
+  @Post('default')
+  upsertDefault(@Body() dto: UpsertRouteEditConfigDto) {
+    return this.service.upsertRouteEditConfig(null, dto);
+  }
+}
+import { Body, Controller, Delete, ForbiddenException, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
+import { EmployeesService } from './employees.service';
+import { CreateEmployeeDto, UpdateEmployeeDto } from './dto/employee.dto';
+import { Roles } from '../common/decorators/roles.decorator';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { CurrentUser, AuthenticatedUser } from '../common/decorators/current-user.decorator';
+
+const CORPORATE_STAFF = [UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN, UserRole.CORPORATE_ADMIN, UserRole.CORPORATE_BOOKER];
+const CORPORATE_ROLES = [UserRole.CORPORATE_ADMIN, UserRole.CORPORATE_BOOKER];
+
+@ApiTags('employees')
+@ApiBearerAuth('access-token')
+@UseGuards(RolesGuard)
+@Controller('corporate/companies/:companyId/employees')
+export class EmployeesController {
+  constructor(private readonly service: EmployeesService) {}
+
+  @Roles(...CORPORATE_STAFF)
+  @Post()
+  create(@Param('companyId') companyId: string, @Body() dto: CreateEmployeeDto, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, companyId);
+    return this.service.create(companyId, dto);
+  }
+
+  @Roles(...CORPORATE_STAFF)
+  @Get()
+  findAll(@Param('companyId') companyId: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, companyId);
+    return this.service.findAllForCompany(companyId);
+  }
+
+  @Roles(...CORPORATE_STAFF)
+  @Get(':id')
+  async findOne(@Param('companyId') companyId: string, @Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, companyId);
+    const employee = await this.service.findOne(id);
+    this.assertEmployeeBelongsToPath(employee, companyId);
+    return employee;
+  }
+
+  @Roles(...CORPORATE_STAFF)
+  @Patch(':id')
+  async update(
+    @Param('companyId') companyId: string,
+    @Param('id') id: string,
+    @Body() dto: UpdateEmployeeDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    this.assertOwnCompany(user, companyId);
+    this.assertEmployeeBelongsToPath(await this.service.findOne(id), companyId);
+    return this.service.update(id, dto);
+  }
+
+  @Roles(...CORPORATE_STAFF)
+  @Delete(':id')
+  async remove(@Param('companyId') companyId: string, @Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, companyId);
+    this.assertEmployeeBelongsToPath(await this.service.findOne(id), companyId);
+    return this.service.remove(id);
+  }
+
+  @Roles(...CORPORATE_STAFF)
+  @Get(':id/trips')
+  async tripHistory(@Param('companyId') companyId: string, @Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertOwnCompany(user, companyId);
+    this.assertEmployeeBelongsToPath(await this.service.findOne(id), companyId);
+    return this.service.tripHistory(id);
+  }
+
+  /** A CORPORATE_* user may only ever act within their own company's employee roster (spec §12). */
+  private assertOwnCompany(user: AuthenticatedUser, companyId: string) {
+    if (CORPORATE_ROLES.includes(user.role as UserRole) && user.companyId !== companyId) {
+      throw new ForbiddenException("You don't have access to this company");
+    }
+  }
+
+  /** Defends against an :id that exists but belongs to a different company than the URL's :companyId. */
+  private assertEmployeeBelongsToPath(employee: { companyId: string }, companyId: string) {
+    if (employee.companyId !== companyId) {
+      throw new ForbiddenException("You don't have access to this employee");
+    }
+  }
+}
+import { Body, Controller, Delete, ForbiddenException, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
+import { PackagesService } from './packages.service';
+import { CreatePackageDto, UpdatePackageDto } from './dto/package.dto';
+import { Roles } from '../common/decorators/roles.decorator';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { CurrentUser, AuthenticatedUser } from '../common/decorators/current-user.decorator';
+
+const CORPORATE_ROLES = [UserRole.CORPORATE_ADMIN, UserRole.CORPORATE_BOOKER, UserRole.CORPORATE_APPROVER];
+
+@ApiTags('packages')
+@ApiBearerAuth('access-token')
+@UseGuards(RolesGuard)
+@Controller('packages')
+export class PackagesController {
+  constructor(private readonly service: PackagesService) {}
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN)
+  @Post()
+  create(@Body() dto: CreatePackageDto) {
+    return this.service.create(dto);
+  }
+
+  @Get()
+  findAll(@CurrentUser() user: AuthenticatedUser, @Query('companyId') companyId?: string) {
+    // A negotiated flat-fare package is commercially sensitive — a CORPORATE_* user may only
+    // ever see their own company's packages (plus platform-wide templates), regardless of what
+    // companyId they pass; only platform admins may browse another company's packages.
+    const scopedCompanyId = CORPORATE_ROLES.includes(user.role) ? user.companyId : companyId;
+    return this.service.findAll(scopedCompanyId);
+  }
+
+  @Get(':id')
+  async findOne(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    const pkg = await this.service.findOne(id);
+    if (CORPORATE_ROLES.includes(user.role) && pkg.companyId && pkg.companyId !== user.companyId) {
+      throw new ForbiddenException("You don't have access to this package");
+    }
+    return pkg;
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN)
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() dto: UpdatePackageDto) {
+    return this.service.update(id, dto);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN)
+  @Delete(':id')
+  remove(@Param('id') id: string) {
+    return this.service.remove(id);
+  }
+}
+import { Inject, Injectable } from '@nestjs/common';
+import { NotificationChannel } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { SMS_PROVIDER, SmsProvider } from './providers/sms-provider.interface';
+
+@Injectable()
+export class NotificationsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    @Inject(SMS_PROVIDER) private readonly smsProvider: SmsProvider,
+  ) {}
+
+  async sendSms(phone: string, message: string) {
+    return this.smsProvider.sendSms(phone, message);
+  }
+
+  async notify(userId: string, title: string, body: string, channel: NotificationChannel = 'IN_APP', data: Record<string, unknown> = {}) {
+    const notification = await this.prisma.notification.create({
+      data: { userId, title, body, channel, data, sentAt: new Date() },
+    });
+    // Push (FCM) / email delivery would be dispatched here in production,
+    // keyed off FCM_SERVER_KEY / an email provider configured in .env.
+    return notification;
+  }
+
+  async listForUser(userId: string) {
+    return this.prisma.notification.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+  }
+
+  async markRead(id: string, userId: string) {
+    return this.prisma.notification.updateMany({
+      where: { id, userId },
+      data: { readAt: new Date() },
+    });
+  }
+}
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { createHmac } from 'crypto';
+import Razorpay from 'razorpay';
+
+/**
+ * Thin wrapper around the Razorpay SDK. Configure RAZORPAY_KEY_ID /
+ * RAZORPAY_KEY_SECRET / RAZORPAY_WEBHOOK_SECRET in .env — see .env.example.
+ * Falls back to a mock order id when no keys are configured so the rest of
+ * the API is exercisable in dev without a live Razorpay account.
+ */
+@Injectable()
+export class RazorpayProvider {
+  private readonly logger = new Logger(RazorpayProvider.name);
+  private client: Razorpay | null = null;
+
+  constructor(private readonly config: ConfigService) {
+    const keyId = this.config.get<string>('RAZORPAY_KEY_ID');
+    const keySecret = this.config.get<string>('RAZORPAY_KEY_SECRET');
+    if (keyId && keySecret && !keyId.startsWith('your-')) {
+      this.client = new Razorpay({ key_id: keyId, key_secret: keySecret });
+    } else {
+      this.logger.warn('Razorpay credentials not configured — orders will be mocked. Set RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET in .env for production.');
+    }
+  }
+
+  async createOrder(amountInRupees: number, receipt: string, currency = 'INR') {
+    if (!this.client) {
+      return { id: `order_mock_${Date.now()}`, amount: Math.round(amountInRupees * 100), currency, receipt };
+    }
+    return this.client.orders.create({ amount: Math.round(amountInRupees * 100), currency, receipt });
+  }
+
+  verifySignature(orderId: string, paymentId: string, signature: string): boolean {
+    const secret = this.config.get<string>('RAZORPAY_KEY_SECRET');
+    if (!secret || secret.startsWith('your-')) return true; // dev mode — skip verification
+    const expected = createHmac('sha256', secret).update(`${orderId}|${paymentId}`).digest('hex');
+    return expected === signature;
+  }
+
+  verifyWebhookSignature(rawBody: string, signature: string): boolean {
+    const secret = this.config.get<string>('RAZORPAY_WEBHOOK_SECRET');
+    if (!secret || secret.startsWith('your-')) return true; // dev mode — skip verification
+    const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+    return expected === signature;
+  }
+
+  async refund(paymentId: string, amountInRupees?: number) {
+    if (!this.client) {
+      return { id: `rfnd_mock_${Date.now()}`, amount: amountInRupees ? Math.round(amountInRupees * 100) : undefined };
+    }
+    return this.client.payments.refund(paymentId, amountInRupees ? { amount: Math.round(amountInRupees * 100) } : undefined);
+  }
+}
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { PricingRule, PricingRuleType } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreatePricingRuleDto, UpdatePricingRuleDto } from './dto/pricing-rule.dto';
+import { FareCalculationInput, FareCalculationResult, FareLine } from './pricing.types';
+
+/**
+ * Configurable pricing engine (spec §10 / §14: "pricing must be configurable
+ * from Admin, never hard-coded"). Every fare component below is resolved by
+ * looking up PricingRule rows rather than using literals in code, so ops can
+ * change base fares, per-km rates, surcharges, taxes etc. per city/zone/
+ * vehicle category/corporate contract without a deploy.
+ */
+@Injectable()
+export class PricingService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  // ---- Rule CRUD (admin-configurable) -----------------------------------
+
+  create(dto: CreatePricingRuleDto) {
+    return this.prisma.pricingRule.create({
+      data: {
+        ...dto,
+        effectiveFrom: dto.effectiveFrom ? new Date(dto.effectiveFrom) : undefined,
+        effectiveTo: dto.effectiveTo ? new Date(dto.effectiveTo) : undefined,
+      },
+    });
+  }
+
+  findAll(filters: { type?: PricingRuleType; categoryId?: string; companyId?: string; city?: string }) {
+    return this.prisma.pricingRule.findMany({
+      where: {
+        type: filters.type,
+        categoryId: filters.categoryId,
+        companyId: filters.companyId,
+        city: filters.city,
+      },
+      orderBy: [{ type: 'asc' }, { priority: 'desc' }],
+    });
+  }
+
+  async findOne(id: string) {
+    const rule = await this.prisma.pricingRule.findUnique({ where: { id } });
+    if (!rule) throw new NotFoundException('Pricing rule not found');
+    return rule;
+  }
+
+  async update(id: string, dto: UpdatePricingRuleDto) {
+    await this.findOne(id);
+    return this.prisma.pricingRule.update({
+      where: { id },
+      data: {
+        ...dto,
+        effectiveFrom: dto.effectiveFrom ? new Date(dto.effectiveFrom) : undefined,
+        effectiveTo: dto.effectiveTo ? new Date(dto.effectiveTo) : undefined,
+      },
+    });
+  }
+
+  async remove(id: string) {
+    await this.findOne(id);
+    return this.prisma.pricingRule.update({ where: { id }, data: { isActive: false } });
+  }
+
+  // ---- Fare calculation ---------------------------------------------------
+
+  /**
+   * Builds a Prisma OR clause for a nullable scoping field: rows scoped to `null`
+   * (platform-wide) always match; rows scoped to a specific value only match when
+   * the current context actually has that value. This must NOT collapse to `{}`
+   * when the context value is missing, or a corporate-specific rule would leak
+   * into non-corporate bookings.
+   */
+  private scopeClause<K extends string>(field: K, ctxValue: string | null | undefined) {
+    return ctxValue ? { OR: [{ [field]: null }, { [field]: ctxValue }] } : { [field]: null };
+  }
+
+  /** Resolves the single most specific active rule of a given type for the current context. */
+  private async findBestRule(type: PricingRuleType, ctx: FareCalculationInput, at: Date): Promise<PricingRule | null> {
+    const candidates = await this.prisma.pricingRule.findMany({
+      where: {
+        type,
+        isActive: true,
+        AND: [
+          this.scopeClause('categoryId', ctx.categoryId),
+          this.scopeClause('companyId', ctx.companyId),
+          this.scopeClause('city', ctx.city),
+          this.scopeClause('zone', ctx.zone),
+          this.scopeClause('packageType', ctx.packageType),
+          { OR: [{ effectiveFrom: null }, { effectiveFrom: { lte: at } }] },
+          { OR: [{ effectiveTo: null }, { effectiveTo: { gte: at } }] },
+        ],
+      },
+    });
+
+    if (candidates.length === 0) return null;
+
+    // Specificity: prefer rules that pin down more of (category/company/city/zone/packageType),
+    // then higher priority, then most recently updated.
+    const score = (r: PricingRule) =>
+      Number(!!r.categoryId) + Number(!!r.companyId) + Number(!!r.city) + Number(!!r.zone) + Number(!!r.packageType);
+
+    return candidates.sort((a, b) => score(b) - score(a) || b.priority - a.priority || (b.updatedAt.getTime() - a.updatedAt.getTime()))[0];
+  }
+
+  private ruleAmount(rule: PricingRule | null, base: number): number {
+    if (!rule) return 0;
+    const value = Number(rule.value);
+    return rule.isPercentage ? (base * value) / 100 : value;
+  }
+
+  async calculateFare(input: FareCalculationInput): Promise<FareCalculationResult> {
+    const at = input.pickupAt ?? new Date();
+    const lines: FareLine[] = [];
+
+    // Corporate package flat fare short-circuits distance/time pricing entirely,
+    // but surcharges/tax/discount rules can still apply on top if configured.
+    if (input.packageFlatFare != null) {
+      lines.push({ lineType: 'PACKAGE_FARE', label: 'Package fare', amount: input.packageFlatFare });
+    } else {
+      const [baseRule, perKmRule, perMinRule] = await Promise.all([
+        this.findBestRule('BASE_FARE', input, at),
+        this.findBestRule('PER_KM', input, at),
+        this.findBestRule('PER_MINUTE', input, at),
+      ]);
+
+      lines.push({ lineType: 'BASE_FARE', label: baseRule?.name ?? 'Base fare', amount: this.ruleAmount(baseRule, 0) });
+      lines.push({
+        lineType: 'DISTANCE',
+        label: perKmRule?.name ?? 'Distance charge',
+        amount: this.ruleAmount(perKmRule, 0) * input.distanceKm,
+        meta: { distanceKm: input.distanceKm, ratePerKm: perKmRule ? Number(perKmRule.value) : 0 },
+      });
+      lines.push({
+        lineType: 'TIME',
+        label: perMinRule?.name ?? 'Time charge',
+        amount: this.ruleAmount(perMinRule, 0) * input.durationMinutes,
+        meta: { durationMinutes: input.durationMinutes, ratePerMinute: perMinRule ? Number(perMinRule.value) : 0 },
+      });
+    }
+
+    // Waiting charge — rules may define a free-minutes grace period in `conditions.freeMinutes`.
+    if (input.waitingMinutes && input.waitingMinutes > 0) {
+      const waitingRule = await this.findBestRule('WAITING_CHARGE', input, at);
+      const freeMinutes = Number((waitingRule?.conditions as any)?.freeMinutes ?? 0);
+      const chargeableMinutes = Math.max(0, input.waitingMinutes - freeMinutes);
+      if (chargeableMinutes > 0) {
+        lines.push({
+          lineType: 'WAITING',
+          label: waitingRule?.name ?? 'Waiting charge',
+          amount: this.ruleAmount(waitingRule, 0) * chargeableMinutes,
+          meta: { waitingMinutes: input.waitingMinutes, freeMinutes, chargeableMinutes },
+        });
+      }
+    }
+
+    if (input.extraStops && input.extraStops > 0) {
+      const extraStopRule = await this.findBestRule('EXTRA_STOP_CHARGE', input, at);
+      lines.push({
+        lineType: 'EXTRA_STOP',
+        label: extraStopRule?.name ?? 'Extra stop charge',
+        amount: this.ruleAmount(extraStopRule, 0) * input.extraStops,
+        meta: { extraStops: input.extraStops },
+      });
+    }
+
+    if (input.tollAmount) {
+      lines.push({ lineType: 'TOLL', label: 'Toll', amount: input.tollAmount });
+    }
+    if (input.parkingAmount) {
+      lines.push({ lineType: 'PARKING', label: 'Parking', amount: input.parkingAmount });
+    }
+
+    if (input.isAirportPickupOrDrop) {
+      const airportRule = await this.findBestRule('AIRPORT_SURCHARGE', input, at);
+      if (airportRule) {
+        lines.push({ lineType: 'AIRPORT_SURCHARGE', label: airportRule.name, amount: this.ruleAmount(airportRule, 0) });
+      }
+    }
+
+    const nightRule = await this.findBestRule('NIGHT_SURCHARGE', input, at);
+    if (nightRule) {
+      const startHour = Number((nightRule.conditions as any)?.startHour ?? 22);
+      const endHour = Number((nightRule.conditions as any)?.endHour ?? 6);
+      const hour = at.getHours();
+      const inWindow = startHour <= endHour ? hour >= startHour && hour < endHour : hour >= startHour || hour < endHour;
+      if (inWindow) {
+        const subtotalSoFar = lines.reduce((s, l) => s + l.amount, 0);
+        lines.push({ lineType: 'NIGHT_SURCHARGE', label: nightRule.name, amount: this.ruleAmount(nightRule, subtotalSoFar) });
+      }
+    }
+
+    const surgeRule = await this.findBestRule('SURGE', input, at);
+    const surgeMultiplier = input.surgeMultiplier ?? Number((surgeRule?.conditions as any)?.multiplier ?? 1);
+    if (surgeMultiplier && surgeMultiplier > 1) {
+      const subtotalSoFar = lines.reduce((s, l) => s + l.amount, 0);
+      lines.push({
+        lineType: 'SURGE',
+        label: surgeRule?.name ?? 'Surge pricing',
+        amount: subtotalSoFar * (surgeMultiplier - 1),
+        meta: { surgeMultiplier },
+      });
+    }
+
+    // Minimum fare floor (applies before tax/discount).
+    const minFareRule = await this.findBestRule('MINIMUM_FARE', input, at);
+    if (minFareRule) {
+      const subtotal = lines.reduce((s, l) => s + l.amount, 0);
+      const floor = Number(minFareRule.value);
+      if (subtotal < floor) {
+        lines.push({ lineType: 'ROUNDING', label: 'Minimum fare top-up', amount: floor - subtotal });
+      }
+    }
+
+    if (input.discountCode) {
+      const discountRule = await this.findBestRule('DISCOUNT', input, at);
+      if (discountRule) {
+        const subtotalSoFar = lines.reduce((s, l) => s + l.amount, 0);
+        lines.push({
+          lineType: 'DISCOUNT',
+          label: discountRule.name,
+          amount: -Math.abs(this.ruleAmount(discountRule, subtotalSoFar)),
+          meta: { discountCode: input.discountCode },
+        });
+      }
+    }
+
+    const taxRule = await this.findBestRule('TAX', input, at);
+    if (taxRule) {
+      const taxableSubtotal = lines.reduce((s, l) => s + l.amount, 0);
+      lines.push({ lineType: 'TAX', label: taxRule.name, amount: this.ruleAmount(taxRule, taxableSubtotal) });
+    }
+
+    const total = Math.round(lines.reduce((s, l) => s + l.amount, 0) * 100) / 100;
+    return { lines, total };
+  }
+
+  async calculateCancellationFee(input: Pick<FareCalculationInput, 'categoryId' | 'companyId' | 'city' | 'zone'>): Promise<number> {
+    const rule = await this.findBestRule('CANCELLATION_FEE', { ...input, distanceKm: 0, durationMinutes: 0 }, new Date());
+    return this.ruleAmount(rule, 0);
+  }
+
+  /**
+   * Priced impact of a mid-trip route change (spec §4: "additional distance,
+   * additional time, additional fare"). Reuses the same PER_KM / EXTRA_STOP_CHARGE
+   * / WAITING_CHARGE rules as the main fare so a route change is priced
+   * consistently with the rest of the trip, rather than a separate hard-coded rate.
+   */
+  async calculateRouteChangeFare(
+    ctx: Pick<FareCalculationInput, 'categoryId' | 'companyId' | 'city' | 'zone' | 'packageType'>,
+    deviationKm: number,
+    additionalStops: number,
+    additionalWaitingMinutes: number,
+  ): Promise<number> {
+    const at = new Date();
+    const [perKmRule, extraStopRule, waitingRule] = await Promise.all([
+      this.findBestRule('PER_KM', ctx as FareCalculationInput, at),
+      this.findBestRule('EXTRA_STOP_CHARGE', ctx as FareCalculationInput, at),
+      this.findBestRule('WAITING_CHARGE', ctx as FareCalculationInput, at),
+    ]);
+
+    const distanceCharge = Math.max(0, deviationKm) * this.ruleAmount(perKmRule, 0);
+    const stopCharge = Math.max(0, additionalStops) * this.ruleAmount(extraStopRule, 0);
+    const waitCharge = Math.max(0, additionalWaitingMinutes) * this.ruleAmount(waitingRule, 0);
+
+    return Math.round((distanceCharge + stopCharge + waitCharge) * 100) / 100;
+  }
+}
+import { Body, Controller, ForbiddenException, Get, Param, Post, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
+import { SettlementsService } from './settlements.service';
+import { Roles } from '../common/decorators/roles.decorator';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { CurrentUser, AuthenticatedUser } from '../common/decorators/current-user.decorator';
+
+const FINANCE_ROLES = [UserRole.SUPER_ADMIN, UserRole.FINANCE_ADMIN];
+
+@ApiTags('settlements')
+@ApiBearerAuth('access-token')
+@UseGuards(RolesGuard)
+@Controller()
+export class SettlementsController {
+  constructor(private readonly service: SettlementsService) {}
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.FINANCE_ADMIN)
+  @Post('vendors/:vendorId/settlements/generate')
+  generate(@Param('vendorId') vendorId: string, @Body() body: { periodStart: string; periodEnd: string }) {
+    return this.service.generateForVendor(vendorId, new Date(body.periodStart), new Date(body.periodEnd));
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.FINANCE_ADMIN, UserRole.VENDOR_ADMIN)
+  @Get('vendors/:vendorId/settlements')
+  findForVendor(@Param('vendorId') vendorId: string, @CurrentUser() user: AuthenticatedUser) {
+    // A VENDOR_ADMIN may only ever list their own vendor's settlements (spec §12 data isolation).
+    if (user.role === UserRole.VENDOR_ADMIN && user.vendorId !== vendorId) {
+      throw new ForbiddenException("You don't have access to this vendor's settlements");
+    }
+    return this.service.findForVendor(vendorId);
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.FINANCE_ADMIN, UserRole.VENDOR_ADMIN)
+  @Get('settlements/:id')
+  async findOne(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    const settlement = await this.service.findOne(id);
+    if (user.role === UserRole.VENDOR_ADMIN && settlement.vendorId !== user.vendorId) {
+      throw new ForbiddenException("You don't have access to this settlement");
+    }
+    return settlement;
+  }
+
+  @Roles(UserRole.SUPER_ADMIN, UserRole.FINANCE_ADMIN)
+  @Post('settlements/:id/mark-paid')
+  markPaid(@Param('id') id: string, @Body('payoutReference') payoutReference: string) {
+    return this.service.markPaid(id, payoutReference);
+  }
+
+  @Roles(UserRole.DRIVER, UserRole.SUPER_ADMIN, UserRole.FINANCE_ADMIN)
+  @Get('drivers/:driverId/earnings/summary')
+  driverSummary(@Param('driverId') driverId: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertDriverAccess(user, driverId);
+    return this.service.driverEarningsSummary(driverId);
+  }
+
+  @Roles(UserRole.DRIVER, UserRole.SUPER_ADMIN, UserRole.FINANCE_ADMIN)
+  @Get('drivers/:driverId/earnings')
+  driverEarnings(@Param('driverId') driverId: string, @CurrentUser() user: AuthenticatedUser) {
+    this.assertDriverAccess(user, driverId);
+    return this.service.driverEarningsList(driverId);
+  }
+
+  /** A DRIVER may only ever read their own earnings; admins can read anyone's. */
+  private assertDriverAccess(user: AuthenticatedUser, driverId: string) {
+    if (FINANCE_ROLES.includes(user.role as UserRole)) return;
+    if (user.role === UserRole.DRIVER && user.driverId === driverId) return;
+    throw new ForbiddenException("You don't have access to this driver's earnings");
+  }
+}

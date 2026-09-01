@@ -1,0 +1,1010 @@
+// Cab Booking & Corporate Transport Platform — core data model
+// Configurable-by-design: pricing, commission, corporate permissions and
+// route-editing limits are all DATA (rows in *Rule / *Config tables), not code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  SUPER_ADMIN
+  OPS_ADMIN
+  FINANCE_ADMIN
+  SUPPORT_ADMIN
+  VENDOR_ADMIN
+  CORPORATE_ADMIN
+  CORPORATE_BOOKER
+  CORPORATE_APPROVER
+  EMPLOYEE
+  DRIVER
+  CUSTOMER
+}
+
+enum AccountStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  BLOCKED
+  DELETED
+}
+
+enum KycStatus {
+  NOT_SUBMITTED
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum VehicleStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  REJECTED
+}
+
+enum BookingSource {
+  CUSTOMER_APP
+  CORPORATE_PORTAL
+  ADMIN_DASHBOARD
+}
+
+enum BookingType {
+  IMMEDIATE
+  SCHEDULED
+  CORPORATE_PACKAGE
+}
+
+enum BookingStatus {
+  DRAFT
+  PENDING_APPROVAL
+  CONFIRMED
+  DISPATCHING
+  DRIVER_ASSIGNED
+  CANCELLED
+  EXPIRED
+  COMPLETED
+}
+
+enum TripStatus {
+  ASSIGNED
+  DRIVER_ARRIVING
+  DRIVER_ARRIVED
+  OTP_VERIFIED
+  IN_PROGRESS
+  AT_STOP
+  COMPLETED
+  CANCELLED
+}
+
+enum StopStatus {
+  PENDING
+  ARRIVED
+  DEPARTED
+  SKIPPED
+}
+
+enum RouteChangeStatus {
+  REQUESTED
+  AUTO_APPROVED
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  UPI
+  WALLET
+  CORPORATE_BILLING
+  NET_BANKING
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  VOID
+}
+
+enum SettlementStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+  ON_HOLD
+}
+
+enum CommissionBasis {
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+enum PricingRuleType {
+  BASE_FARE
+  PER_KM
+  PER_MINUTE
+  MINIMUM_FARE
+  WAITING_CHARGE
+  EXTRA_STOP_CHARGE
+  TOLL
+  PARKING
+  AIRPORT_SURCHARGE
+  NIGHT_SURCHARGE
+  SURGE
+  CANCELLATION_FEE
+  TAX
+  DISCOUNT
+  PACKAGE_FARE
+}
+
+enum FareLineType {
+  BASE_FARE
+  PACKAGE_FARE
+  DISTANCE
+  TIME
+  WAITING
+  EXTRA_STOP
+  TOLL
+  PARKING
+  AIRPORT_SURCHARGE
+  NIGHT_SURCHARGE
+  SURGE
+  TAX
+  DISCOUNT
+  ROUTE_CHANGE_ADJUSTMENT
+  CANCELLATION_FEE
+  ROUNDING
+}
+
+enum NotificationChannel {
+  SMS
+  PUSH
+  EMAIL
+  IN_APP
+}
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_ON_CUSTOMER
+  RESOLVED
+  CLOSED
+}
+
+enum ApprovalWorkflowRole {
+  ANY_APPROVER
+  BOOKER
+  CORPORATE_ADMIN
+  DESIGNATED_APPROVER
+  PLATFORM_ADMIN
+}
+
+// ---------------------------------------------------------------------------
+// IDENTITY
+// ---------------------------------------------------------------------------
+
+model User {
+  id                String        @id @default(uuid())
+  phone             String        @unique
+  email             String?       @unique
+  passwordHash      String?
+  fullName          String
+  role              UserRole
+  status            AccountStatus @default(PENDING)
+  profilePhotoUrl   String?
+  languagePreference String       @default("en")
+  lastLoginAt       DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  customer          Customer?
+  driver            Driver?
+  vendorMembership  VendorUser?
+  corporateMembership CorporateUser?
+  otpCodes          OtpCode[]
+  refreshTokens     RefreshToken[]
+  auditLogs         AuditLog[]
+  notifications     Notification[]
+  supportTicketsRaised SupportTicket[] @relation("TicketRaisedBy")
+  ratingsGiven      Rating[]      @relation("RatingsGiven")
+  ratingsReceived   Rating[]      @relation("RatingsReceived")
+  routeChangesMade  RouteChange[] @relation("RouteChangeInitiatedBy")
+  routeChangesApproved RouteChange[] @relation("RouteChangeApprovedBy")
+
+  @@index([role])
+  @@map("users")
+}
+
+model OtpCode {
+  id        String   @id @default(uuid())
+  userId    String?
+  phone     String
+  codeHash  String
+  purpose   String   @default("LOGIN") // LOGIN | SIGNUP | RESET
+  expiresAt DateTime
+  consumedAt DateTime?
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([phone])
+  @@map("otp_codes")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// CUSTOMERS
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id            String   @id @default(uuid())
+  userId        String   @unique
+  walletBalance Decimal  @default(0) @db.Decimal(12, 2)
+  homeAddress   String?
+  workAddress   String?
+  emergencyContacts Json @default("[]")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookings Booking[] @relation("CustomerBookings")
+
+  @@map("customers")
+}
+
+// ---------------------------------------------------------------------------
+// VENDORS / FLEET / DRIVERS / VEHICLES
+// ---------------------------------------------------------------------------
+
+model Vendor {
+  id            String        @id @default(uuid())
+  legalName     String
+  displayName   String
+  gstNumber     String?
+  panNumber     String?
+  contactPhone  String
+  contactEmail  String?
+  bankAccountNumber String?
+  bankIfsc      String?
+  status        AccountStatus @default(PENDING)
+  city          String?
+  zone          String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  users       VendorUser[]
+  drivers     Driver[]
+  vehicles    Vehicle[]
+  commissionRules CommissionRule[]
+  settlements VendorSettlement[]
+
+  @@map("vendors")
+}
+
+model VendorUser {
+  id       String   @id @default(uuid())
+  userId   String   @unique
+  vendorId String
+  title    String?  // e.g. Fleet Manager
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@index([vendorId])
+  @@map("vendor_users")
+}
+
+model Driver {
+  id                String        @id @default(uuid())
+  userId            String        @unique
+  vendorId          String?
+  licenseNumber     String        @unique
+  licenseExpiry     DateTime?
+  kycStatus         KycStatus     @default(NOT_SUBMITTED)
+  isOnline          Boolean       @default(false)
+  isAvailable       Boolean       @default(false)
+  currentLat        Decimal?      @db.Decimal(10, 7)
+  currentLng        Decimal?      @db.Decimal(10, 7)
+  currentLocationAt DateTime?
+  rating            Decimal       @default(5.0) @db.Decimal(3, 2)
+  totalTrips        Int           @default(0)
+  status            AccountStatus @default(PENDING)
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vendor          Vendor?          @relation(fields: [vendorId], references: [id])
+  documents       DriverDocument[]
+  vehicles        Vehicle[]        @relation("DriverVehicles")
+  trips           Trip[]
+  earnings        DriverEarning[]
+  gpsEvents       GpsLocationEvent[]
+
+  @@index([vendorId])
+  @@index([isOnline, isAvailable])
+  @@map("drivers")
+}
+
+model DriverDocument {
+  id         String    @id @default(uuid())
+  driverId   String
+  type       String    // DRIVING_LICENSE | AADHAAR | POLICE_VERIFICATION | ...
+  fileUrl    String
+  status     KycStatus @default(PENDING_REVIEW)
+  reviewedBy String?
+  reviewedAt DateTime?
+  expiresAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  driver Driver @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@index([driverId])
+  @@map("driver_documents")
+}
+
+model VehicleCategory {
+  id            String   @id @default(uuid())
+  name          String   @unique // Mini, Sedan, SUV, Luxury, Corporate XL...
+  description   String?
+  seatingCapacity Int
+  iconUrl       String?
+  isActive      Boolean  @default(true)
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  vehicles     Vehicle[]
+  pricingRules PricingRule[]
+  commissionRules CommissionRule[]
+  packages     Package[]
+  bookings     Booking[]
+
+  @@map("vehicle_categories")
+}
+
+model Vehicle {
+  id                 String        @id @default(uuid())
+  vendorId           String
+  categoryId         String
+  registrationNumber String        @unique
+  make               String
+  model              String
+  year               Int
+  colour             String
+  seatingCapacity    Int
+  rcDocumentUrl      String?
+  insuranceDocumentUrl String?
+  insuranceExpiry    DateTime?
+  permitDocumentUrl  String?
+  permitExpiry       DateTime?
+  fitnessCertificateUrl String?
+  fitnessExpiry      DateTime?
+  status             VehicleStatus @default(PENDING_APPROVAL)
+  approvedBy         String?
+  approvedAt         DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  vendor   Vendor          @relation(fields: [vendorId], references: [id])
+  category VehicleCategory @relation(fields: [categoryId], references: [id])
+  drivers  Driver[]        @relation("DriverVehicles")
+  trips    Trip[]
+
+  @@index([vendorId])
+  @@index([categoryId])
+  @@index([status])
+  @@map("vehicles")
+}
+
+// ---------------------------------------------------------------------------
+// CORPORATE
+// ---------------------------------------------------------------------------
+
+model CorporateCompany {
+  id             String   @id @default(uuid())
+  legalName      String
+  displayName    String
+  gstNumber      String?
+  billingAddress String?
+  contactEmail   String
+  contactPhone   String
+  creditLimit    Decimal  @default(0) @db.Decimal(14, 2)
+  creditUsed     Decimal  @default(0) @db.Decimal(14, 2)
+  billingCycle   String   @default("MONTHLY") // MONTHLY | WEEKLY | ON_DEMAND
+  status         AccountStatus @default(PENDING)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  users          CorporateUser[]
+  employees      Employee[]
+  routeEditConfig CorporateRouteEditConfig?
+  packages       Package[]
+  bookings       Booking[]        @relation("CorporateBookings")
+  invoices       CorporateInvoice[]
+  commissionRules CommissionRule[]
+  pricingRules   PricingRule[]
+
+  @@map("corporate_companies")
+}
+
+model CorporateUser {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  companyId String
+  role      UserRole // CORPORATE_ADMIN | CORPORATE_BOOKER | CORPORATE_APPROVER
+  department String?
+  createdAt DateTime @default(now())
+
+  user    User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company CorporateCompany @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@map("corporate_users")
+}
+
+model Employee {
+  id           String   @id @default(uuid())
+  companyId    String
+  fullName     String
+  phone        String
+  email        String?
+  employeeCode String?
+  department   String?
+  costCenter   String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company  CorporateCompany @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bookings Booking[]        @relation("EmployeeBookings")
+
+  @@index([companyId])
+  @@unique([companyId, phone])
+  @@map("employees")
+}
+
+// Admin-configurable route editing rules, per corporate company (or platform default when companyId is null)
+model CorporateRouteEditConfig {
+  id                       String   @id @default(uuid())
+  companyId                String?  @unique
+  routeEditingAllowed      Boolean  @default(false)
+  maxAdditionalStops       Int      @default(0)
+  maxRouteDeviationKm      Decimal  @default(0) @db.Decimal(6, 2)
+  maxAdditionalWaitingMinutes Int   @default(0)
+  approvalRequired         Boolean  @default(true)
+  approverRole             ApprovalWorkflowRole @default(BOOKER)
+  additionalChargesAllowed Boolean  @default(true)
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  company CorporateCompany? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@map("corporate_route_edit_configs")
+}
+
+// A reusable package template a corporate company can book against (e.g. "Airport transfer", "Full day city")
+model Package {
+  id                String   @id @default(uuid())
+  companyId         String?  // null = platform-wide package template
+  name              String
+  description       String?
+  categoryId        String
+  packageType       String   // AIRPORT_TRANSFER | FULL_DAY | POINT_TO_POINT | OUTSTATION | HOURLY
+  includedKm        Decimal? @db.Decimal(8, 2)
+  includedMinutes   Int?
+  includedStops     Int      @default(0)
+  flatFare          Decimal? @db.Decimal(10, 2)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  company  CorporateCompany? @relation(fields: [companyId], references: [id])
+  category VehicleCategory   @relation(fields: [categoryId], references: [id])
+  bookings Booking[]
+
+  @@map("packages")
+}
+
+// ---------------------------------------------------------------------------
+// BOOKINGS / TRIPS
+// ---------------------------------------------------------------------------
+
+model Booking {
+  id               String        @id @default(uuid())
+  source           BookingSource
+  type             BookingType
+  status           BookingStatus @default(DRAFT)
+
+  customerId       String?
+  companyId        String?
+  employeeId       String?
+  bookedByUserId   String?       // who actually created the booking (booker/admin/customer)
+  packageId        String?
+  categoryId       String
+  vehicleCategoryRequested String?
+
+  pickupLabel      String
+  pickupLat        Decimal       @db.Decimal(10, 7)
+  pickupLng        Decimal       @db.Decimal(10, 7)
+  dropLabel        String
+  dropLat          Decimal       @db.Decimal(10, 7)
+  dropLng          Decimal       @db.Decimal(10, 7)
+
+  scheduledAt      DateTime?
+  passengerName    String?
+  passengerPhone   String?
+  specialInstructions String?
+
+  estimatedDistanceKm Decimal?   @db.Decimal(8, 2)
+  estimatedDurationMinutes Int?
+  estimatedFare    Decimal?      @db.Decimal(10, 2)
+
+  approvalRequired Boolean       @default(false)
+  approvedByUserId String?
+  approvedAt       DateTime?
+
+  cancelledAt      DateTime?
+  cancelledByUserId String?
+  cancellationReason String?
+
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  customer  Customer?         @relation("CustomerBookings", fields: [customerId], references: [id])
+  company   CorporateCompany? @relation("CorporateBookings", fields: [companyId], references: [id])
+  employee  Employee?         @relation("EmployeeBookings", fields: [employeeId], references: [id])
+  package   Package?          @relation(fields: [packageId], references: [id])
+  category  VehicleCategory   @relation(fields: [categoryId], references: [id])
+
+  stops    BookingStop[]
+  trip     Trip?
+  fareBreakdowns FareBreakdown[]
+
+  @@index([customerId])
+  @@index([companyId])
+  @@index([status])
+  @@map("bookings")
+}
+
+model BookingStop {
+  id            String   @id @default(uuid())
+  bookingId     String
+  sequence      Int
+  label         String
+  lat           Decimal  @db.Decimal(10, 7)
+  lng           Decimal  @db.Decimal(10, 7)
+  plannedWaitMinutes Int @default(0)
+  createdAt     DateTime @default(now())
+
+  booking Booking    @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  tripStop TripStop?
+
+  @@index([bookingId])
+  @@map("booking_stops")
+}
+
+model Trip {
+  id               String     @id @default(uuid())
+  bookingId        String     @unique
+  driverId         String?
+  vehicleId        String?
+  status           TripStatus @default(ASSIGNED)
+
+  otpCode          String?
+  otpVerifiedAt    DateTime?
+
+  driverAssignedAt DateTime?
+  arrivedAtPickupAt DateTime?
+  startedAt        DateTime?
+  completedAt      DateTime?
+  cancelledAt      DateTime?
+  cancelledByUserId String?
+  cancellationReason String?
+
+  actualDistanceKm Decimal?   @db.Decimal(8, 2)
+  actualDurationMinutes Int?
+  finalFare        Decimal?   @db.Decimal(10, 2)
+
+  polyline         String?    // encoded route polyline of actual path
+
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  booking  Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  driver   Driver?   @relation(fields: [driverId], references: [id])
+  vehicle  Vehicle?  @relation(fields: [vehicleId], references: [id])
+
+  stops        TripStop[]
+  routeChanges RouteChange[]
+  gpsEvents    GpsLocationEvent[]
+  payments     Payment[]
+  ratings      Rating[]
+  fareBreakdowns FareBreakdown[]
+
+  @@index([driverId])
+  @@index([status])
+  @@map("trips")
+}
+
+model TripStop {
+  id           String     @id @default(uuid())
+  tripId       String
+  bookingStopId String?   @unique
+  sequence     Int
+  label        String
+  lat          Decimal    @db.Decimal(10, 7)
+  lng          Decimal    @db.Decimal(10, 7)
+  status       StopStatus @default(PENDING)
+  arrivedAt    DateTime?
+  departedAt   DateTime?
+  plannedWaitMinutes Int  @default(0)
+  actualWaitMinutes  Int?
+  addedByRouteChangeId String?
+  createdAt    DateTime   @default(now())
+
+  trip        Trip         @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  bookingStop BookingStop? @relation(fields: [bookingStopId], references: [id])
+
+  @@index([tripId])
+  @@map("trip_stops")
+}
+
+// Every route modification during a trip — full audit trail as required by spec §4
+model RouteChange {
+  id                  String             @id @default(uuid())
+  tripId              String
+  initiatedByUserId   String
+  status              RouteChangeStatus  @default(REQUESTED)
+
+  originalRouteSnapshot Json             // [{lat,lng,label,sequence}, ...]
+  newRouteSnapshot     Json
+
+  changeLat           Decimal            @db.Decimal(10, 7)
+  changeLng           Decimal            @db.Decimal(10, 7)
+  reason              String?
+
+  additionalDistanceKm Decimal           @default(0) @db.Decimal(8, 2)
+  additionalTimeMinutes Int              @default(0)
+  additionalFare       Decimal           @default(0) @db.Decimal(10, 2)
+
+  approvalRequired     Boolean           @default(false)
+  approvedByUserId     String?
+  approvedAt           DateTime?
+  rejectionReason      String?
+
+  requestedAt          DateTime          @default(now())
+  resolvedAt           DateTime?
+
+  trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  initiatedBy User @relation("RouteChangeInitiatedBy", fields: [initiatedByUserId], references: [id])
+  approvedBy  User? @relation("RouteChangeApprovedBy", fields: [approvedByUserId], references: [id])
+
+  @@index([tripId])
+  @@map("route_changes")
+}
+
+// ---------------------------------------------------------------------------
+// PRICING ENGINE (configurable, not hard-coded)
+// ---------------------------------------------------------------------------
+
+model PricingRule {
+  id           String          @id @default(uuid())
+  name         String
+  type         PricingRuleType
+  categoryId   String?
+  companyId    String?         // corporate-specific override
+  city         String?
+  zone         String?
+  packageType  String?
+
+  value        Decimal         @db.Decimal(10, 4) // amount or percentage depending on `isPercentage`
+  isPercentage Boolean         @default(false)
+
+  conditions   Json            @default("{}") // e.g. {"startHour":22,"endHour":6} for night surcharge, {"minMultiplier":1.2} for surge
+  priority     Int             @default(0)     // higher runs later / can override
+  isActive     Boolean         @default(true)
+  effectiveFrom DateTime?
+  effectiveTo   DateTime?
+
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  category VehicleCategory?   @relation(fields: [categoryId], references: [id])
+  company  CorporateCompany?  @relation(fields: [companyId], references: [id])
+
+  @@index([type])
+  @@index([categoryId])
+  @@index([companyId])
+  @@map("pricing_rules")
+}
+
+model CommissionRule {
+  id          String          @id @default(uuid())
+  name        String
+  basis       CommissionBasis @default(PERCENTAGE)
+  value       Decimal         @db.Decimal(10, 4) // percentage (0-100) or fixed amount
+
+  vendorId    String?
+  driverId    String?
+  categoryId  String?
+  companyId   String?         // corporate contract specific
+  city        String?
+  zone        String?
+  packageType String?
+
+  priority    Int             @default(0) // higher priority wins when multiple rules match
+  isActive    Boolean         @default(true)
+  effectiveFrom DateTime?
+  effectiveTo   DateTime?
+
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  vendor   Vendor?           @relation(fields: [vendorId], references: [id])
+  category VehicleCategory?  @relation(fields: [categoryId], references: [id])
+  company  CorporateCompany? @relation(fields: [companyId], references: [id])
+
+  @@index([vendorId])
+  @@index([companyId])
+  @@map("commission_rules")
+}
+
+model FareBreakdown {
+  id        String       @id @default(uuid())
+  bookingId String?
+  tripId    String?
+  lineType  FareLineType
+  label     String
+  amount    Decimal      @db.Decimal(10, 2)
+  meta      Json         @default("{}")
+  createdAt DateTime     @default(now())
+
+  booking Booking? @relation(fields: [bookingId], references: [id])
+  trip    Trip?    @relation(fields: [tripId], references: [id])
+
+  @@index([bookingId])
+  @@index([tripId])
+  @@map("fare_breakdowns")
+}
+
+// ---------------------------------------------------------------------------
+// PAYMENTS / BILLING / SETTLEMENTS
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id                String        @id @default(uuid())
+  tripId            String
+  method            PaymentMethod
+  status            PaymentStatus @default(PENDING)
+  amount            Decimal       @db.Decimal(10, 2)
+  currency          String        @default("INR")
+
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+  razorpaySignature String?
+
+  refundedAmount    Decimal       @default(0) @db.Decimal(10, 2)
+  failureReason     String?
+
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  trip Trip @relation(fields: [tripId], references: [id])
+
+  @@index([tripId])
+  @@index([status])
+  @@map("payments")
+}
+
+model CorporateInvoice {
+  id            String        @id @default(uuid())
+  companyId     String
+  invoiceNumber String        @unique
+  status        InvoiceStatus @default(DRAFT)
+  periodStart   DateTime
+  periodEnd     DateTime
+  subtotal      Decimal       @db.Decimal(14, 2)
+  taxAmount     Decimal       @default(0) @db.Decimal(14, 2)
+  totalAmount   Decimal       @db.Decimal(14, 2)
+  amountPaid    Decimal       @default(0) @db.Decimal(14, 2)
+  dueDate       DateTime?
+  issuedAt      DateTime?
+  paidAt        DateTime?
+  lineItems     Json          @default("[]") // [{tripId, description, amount}]
+  pdfUrl        String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  company CorporateCompany @relation(fields: [companyId], references: [id])
+
+  @@index([companyId])
+  @@index([status])
+  @@map("corporate_invoices")
+}
+
+model VendorSettlement {
+  id            String           @id @default(uuid())
+  vendorId      String
+  periodStart   DateTime
+  periodEnd     DateTime
+  status        SettlementStatus @default(PENDING)
+  grossAmount   Decimal          @db.Decimal(14, 2)
+  commissionAmount Decimal       @db.Decimal(14, 2)
+  netPayable    Decimal          @db.Decimal(14, 2)
+  tripCount     Int              @default(0)
+  lineItems     Json             @default("[]") // [{tripId, fare, commission, payable}]
+  paidAt        DateTime?
+  payoutReference String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  vendor Vendor @relation(fields: [vendorId], references: [id])
+
+  @@index([vendorId])
+  @@index([status])
+  @@map("vendor_settlements")
+}
+
+model DriverEarning {
+  id          String   @id @default(uuid())
+  driverId    String
+  tripId      String?
+  description String
+  amount      Decimal  @db.Decimal(10, 2)
+  isCredit    Boolean  @default(true) // false = deduction
+  settlementId String?
+  createdAt   DateTime @default(now())
+
+  driver Driver @relation(fields: [driverId], references: [id])
+
+  @@index([driverId])
+  @@map("driver_earnings")
+}
+
+// ---------------------------------------------------------------------------
+// SUPPORTING SYSTEMS
+// ---------------------------------------------------------------------------
+
+model Rating {
+  id           String   @id @default(uuid())
+  tripId       String
+  ratedByUserId String
+  ratedUserId  String
+  score        Int      // 1-5
+  comment      String?
+  createdAt    DateTime @default(now())
+
+  trip     Trip @relation(fields: [tripId], references: [id])
+  ratedBy  User @relation("RatingsGiven", fields: [ratedByUserId], references: [id])
+  ratedUser User @relation("RatingsReceived", fields: [ratedUserId], references: [id])
+
+  @@index([tripId])
+  @@index([ratedUserId])
+  @@map("ratings")
+}
+
+model Notification {
+  id        String              @id @default(uuid())
+  userId    String
+  channel   NotificationChannel
+  title     String
+  body      String
+  data      Json                @default("{}")
+  readAt    DateTime?
+  sentAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("notifications")
+}
+
+model SupportTicket {
+  id          String              @id @default(uuid())
+  raisedByUserId String
+  subject     String
+  description String
+  category    String              @default("GENERAL")
+  status      SupportTicketStatus @default(OPEN)
+  relatedTripId String?
+  assignedToUserId String?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  resolvedAt  DateTime?
+
+  raisedBy User @relation("TicketRaisedBy", fields: [raisedByUserId], references: [id])
+  messages SupportTicketMessage[]
+
+  @@index([status])
+  @@map("support_tickets")
+}
+
+model SupportTicketMessage {
+  id        String   @id @default(uuid())
+  ticketId  String
+  authorUserId String
+  message   String
+  attachmentUrl String?
+  createdAt DateTime @default(now())
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("support_ticket_messages")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@map("audit_logs")
+}
+
+model GpsLocationEvent {
+  id        String   @id @default(uuid())
+  driverId  String
+  tripId    String?
+  lat       Decimal  @db.Decimal(10, 7)
+  lng       Decimal  @db.Decimal(10, 7)
+  speedKmh  Decimal? @db.Decimal(6, 2)
+  heading   Decimal? @db.Decimal(6, 2)
+  recordedAt DateTime @default(now())
+
+  driver Driver @relation(fields: [driverId], references: [id])
+  trip   Trip?  @relation(fields: [tripId], references: [id])
+
+  @@index([driverId, recordedAt])
+  @@index([tripId])
+  @@map("gps_location_events")
+}
